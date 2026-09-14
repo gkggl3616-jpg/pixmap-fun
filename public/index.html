@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#080b12">
+  <meta name="description" content="Canlı, ortak ve Redis gerektirmeyen piksel haritası.">
+  <title>Pixmap Fun — Canlı Piksel Haritası</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Pixmap Fun ana sayfa">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span><strong>PIXMAP</strong><small>FUN • LIVE CANVAS</small></span>
+    </a>
+    <div class="live-pill"><span></span><b id="onlineCount">1</b> çevrimiçi</div>
+    <button class="icon-button" id="soundButton" type="button" aria-label="Sesi aç veya kapat" title="Ses">♪</button>
+  </header>
+
+  <main class="layout">
+    <section class="stage-card">
+      <div class="stage-head">
+        <div>
+          <span class="eyebrow">ORTAK TUVAL</span>
+          <h1>Dünyaya izini bırak.</h1>
+        </div>
+        <div class="coords" id="coords">X: — &nbsp; Y: —</div>
+      </div>
+
+      <div class="canvas-shell" id="canvasShell">
+        <canvas id="canvas" aria-label="Piksel çizim alanı"></canvas>
+        <div class="canvas-grid" aria-hidden="true"></div>
+        <div class="status-toast" id="toast" role="status"></div>
+        <div class="zoom-controls">
+          <button id="zoomOut" type="button" aria-label="Uzaklaştır">−</button>
+          <button id="fitCanvas" type="button" aria-label="Tuvali sığdır">⌗</button>
+          <button id="zoomIn" type="button" aria-label="Yakınlaştır">+</button>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="mode-switch" role="group" aria-label="Araç seçimi">
+          <button class="active" id="paintMode" type="button"><span>✦</span> Piksel</button>
+          <button id="panMode" type="button"><span>✥</span> Gez</button>
+        </div>
+        <div class="cooldown"><span id="cooldownRing"></span><div><small>HAZIRLIK</small><b id="cooldownText">Hazır</b></div></div>
+      </div>
+
+      <div class="palette-wrap">
+        <div class="section-label"><span>RENK PALETİ</span><small id="selectedHex">#ED1C24</small></div>
+        <div class="palette" id="palette" role="radiogroup" aria-label="Renk seç"></div>
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <section class="profile-card panel">
+        <div class="section-label"><span>OYUNCU PROFİLİ</span><span class="status-dot">AKTİF</span></div>
+        <label for="playerName">Görünen ad</label>
+        <div class="name-row"><input id="playerName" maxlength="20" autocomplete="nickname" placeholder="Misafir"><button id="saveName" type="button">Kaydet</button></div>
+        <div class="profile-stats">
+          <div><small>BUGÜN</small><b id="dailyScore">0</b><span>piksel</span></div>
+          <div><small>TOPLAM</small><b id="totalScore">0</b><span>piksel</span></div>
+        </div>
+      </section>
+
+      <section class="rank-card panel">
+        <div class="section-label"><span>GÜNLÜK SIRALAMA</span><button id="refreshRanks" type="button">Yenile</button></div>
+        <div class="rank-list" id="rankList"><div class="empty-state">İlk pikseli sen bırak.</div></div>
+      </section>
+
+      <section class="security-card panel">
+        <div class="security-icon">⌁</div>
+        <div><small>BAĞLANTI KORUMASI</small><b id="proxyTitle">Kontrol ediliyor…</b><span id="proxyDetail">Proxy/VPN denetimi hazırlanıyor</span></div>
+        <button id="checkProxy" type="button" aria-label="Bağlantıyı tekrar kontrol et">↻</button>
+      </section>
+
+      <section class="info-card panel">
+        <b>Redis gerekmez.</b>
+        <p>Bu hafif test sürümü verileri yerel bir JSON dosyasında tutar ve tüm oyunculara canlı olarak iletir.</p>
+      </section>
+    </aside>
+  </main>
+
+  <nav class="mobile-nav" aria-label="Mobil araçlar">
+    <button class="active" data-mobile-mode="paint"><span>✦</span>Piksel</button>
+    <button data-mobile-mode="pan"><span>✥</span>Gez</button>
+    <button id="mobileRank"><span>♜</span>Sıralama</button>
+  </nav>
+  <script src="/app.js" defer></script>
+</body>
+</html>
