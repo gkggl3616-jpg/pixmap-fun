@@ -1,0 +1,112 @@
+force_original_aspect_ratio=decrease")
+    if ext=="mp4": filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+    if preview:
+        filters.append("scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease")
+    if filters: cmd += ["-vf",",".join(filters)]
+    if ext=="mp4":
+        cmd += ["-c:v","libx264","-preset","veryfast" if preview else quality["preset"],"-crf","28" if preview else quality["crf"],"-pix_fmt","yuv420p"]
+        if compat: cmd += ["-movflags","+faststart","-tag:v","avc1"]
+        cmd += [str(out)]
+    elif ext=="webm":
+        if "lossless" in fmt: cmd += ["-c:v","libvpx-vp9","-lossless","1","-pix_fmt","yuv444p",str(out)]
+        else: cmd += ["-c:v","libvpx-vp9","-crf","32" if preview else "28","-b:v","0",str(out)]
+    else:
+        cmd += [str(out)]
+    st.log("FFmpeg: "+" ".join(cmd))
+    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,errors="replace")
+    for line in proc.stdout or []:
+        if st.job.get("cancel"):
+            proc.terminate();raise RuntimeError("İşlem iptal edildi.")
+        if "frame=" in line or "time=" in line: st.set_job(status="Video oluşturuluyor…")
+    proc.wait()
+    if proc.returncode!=0: raise RuntimeError(f"FFmpeg hata kodu: {proc.returncode}")
+    verify=media_verify(out,fmt)
+    if not verify["ok"]: raise RuntimeError("Video doğrulanamadı: "+verify["detail"])
+    st.log("Doğrulama: "+verify["detail"])
+    return out,fps,verify
+
+
+def run_compile(st,payload,preview=False):
+    if st.job.get("running"): raise RuntimeError("Başka bir işlem zaten çalışıyor.")
+    health=st.frame_health()
+    if not health["count"]: raise RuntimeError("Kare bulunamadı.")
+    s=int(payload.get("start_frame",health["min"]));e=int(payload.get("end_frame",health["max"]))
+    st.set_job(running=True,cancel=False,kind="preview" if preview else "compile",progress=5,status="Kareler hazırlanıyor…",logs=[],output=None,ok=None)
+    def worker():
+        try:
+            out,fps,verify=compile_range(st,s,e,payload,preview=preview)
+            st.log(f"Çıktı hazır: {out.name} • {fps:.2f} FPS")
+            st.set_job(running=False,progress=100,status="Önizleme hazır ✓" if preview else "Video hazır ✓",output=out.name,frames=e-s+1,ok=True)
+        except Exception as ex:
+            st.log("HATA: "+str(ex));st.set_job(running=False,progress=0,status="Hata: "+str(ex),ok=False)
+    threading.Thread(target=worker,daemon=True).start()
+
+
+def run_timelapse(st,payload):
+    if st.job.get("running"): raise RuntimeError("Başka bir işlem zaten çalışıyor.")
+    cid=str(payload.get("canvas_id","0"));canvas=GLOBAL["canvases"].get(cid)
+    if not canvas: raise ValueError("Tuval bulunamadı.")
+    coords=parse_coords(payload.get("start",""),payload.get("end",""),canvas)
+    sd=datetime.date.fromisoformat(payload["start_date"]);ed=datetime.date.fromisoformat(payload["end_date"])
+    if sd>ed: raise ValueError("Başlangıç tarihi bitiş tarihinden sonra olamaz.")
+    frameskip=max(1,int(payload.get("frameskip",1)));resume=bool(payload.get("resume",True));compile_video=bool(payload.get("compile",True))
+    signature={"canvas_id":cid,"coords":coords,"start_date":str(sd),"end_date":str(ed),"frameskip":frameskip}
+    st.save_settings({"last_timelapse":signature})
+    st.set_job(running=True,cancel=False,kind="timelapse",progress=0,status="Timelapse hazırlanıyor…",logs=[],output=None,frames=0,ok=None)
+    def worker():
+        sess=None
+        try:
+            x1,y1,x2,y2=coords;w,h=x2-x1+1,y2-y1+1;chunks,_,center=get_canvas_geometry(canvas);bg=tuple(canvas.get("colors",[[202,227,255]])[0][:3])+(255,)
+            cxs=max(0,(x1+center)//CHUNK_PX);cys=max(0,(y1+center)//CHUNK_PX);cxe=min(chunks-1,(x2+center)//CHUNK_PX);cye=min(chunks-1,(y2+center)//CHUNK_PX)
+            if not resume:
+                for p in st.frames_dir.glob("t*.png"):
+                    try:p.unlink()
+                    except OSError:pass
+            sess=make_session();curr=sd;days=(ed-sd).days+1;frame_cnt=0;previous=None;reused=0;repaired=0
+            def hist(job):
+                cx,cy,day,hhmm=job;return cx,cy,fetch_raw(f"{PIXMAP_URL}/history/chunk/{cid}/{day}/{hhmm}/{cx}_{cy}.png",sess,8)
+            while curr<=ed:
+                if st.job.get("cancel"): raise RuntimeError("İşlem iptal edildi.")
+                di=(curr-sd).days;day=curr.strftime("%Y%m%d");st.log(f"{day}: snapshot listesi alınıyor…")
+                raw=fetch_raw(f"{PIXMAP_URL}/history/snapshots/{cid}?day={day}",sess,8);snaps=[]
+                if raw:
+                    try:
+                        d=json.loads(raw.decode());snaps=[s["hhmm"] if isinstance(s,dict) else s for s in d.get("snapshots",[])];snaps.sort()
+                    except Exception: pass
+                if not snaps:
+                    st.log(f"{day}: snapshot yok.");curr+=datetime.timedelta(days=1);continue
+                base=Image.new("RGBA",(w,h),bg)
+                jobs=[(cx,cy,day,"0000") for cy in range(cys,cye+1) for cx in range(cxs,cxe+1)]
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                    for cx,cy,data in pool.map(hist,jobs):
+                        if data:
+                            try:
+                                im=Image.open(io.BytesIO(data)).convert("RGBA");safe_paste(base,im,cx*CHUNK_PX-center-x1,cy*CHUNK_PX-center-y1)
+                            except Exception: pass
+                if base.getcolors(1) is not None and previous is not None: base=previous.copy()
+                frame_cnt+=1;fp=st.frames_dir/f"t{frame_cnt}.png"
+                healthy=False
+                if resume and fp.is_file():
+                    try:
+                        with Image.open(fp) as im: im.verify();healthy=True
+                    except Exception: repaired+=1
+                if healthy: reused+=1
+                else: base.save(fp)
+                diffs=[x for x in snaps if x!="0000"];last=base
+                for idx,hhmm in enumerate(diffs):
+                    if st.job.get("cancel"): raise RuntimeError("İşlem iptal edildi.")
+                    if ((idx+1)%frameskip)!=0: continue
+                    rel=base.copy();jobs=[(cx,cy,day,hhmm) for cy in range(cys,cye+1) for cx in range(cxs,cxe+1)]
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                        for cx,cy,data in pool.map(hist,jobs):
+                            if data:
+                                try:
+                                    im=Image.open(io.BytesIO(data)).convert("RGBA");safe_paste(rel,im,cx*CHUNK_PX-center-x1,cy*CHUNK_PX-center-y1)
+                                except Exception: pass
+                    frame_cnt+=1;fp=st.frames_dir/f"t{frame_cnt}.png";healthy=False
+                    if resume and fp.is_file():
+                        try:
+                            with Image.open(fp) as im: im.verify();healthy=True
+                        except Exception: repaired+=1
+                    if healthy: reused+=1
+                    else: 
