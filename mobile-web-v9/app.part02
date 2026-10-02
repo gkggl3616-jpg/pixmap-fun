@@ -1,0 +1,144 @@
+0:]
+
+    def set_job(self, **kw):
+        with self.lock: self.job.update(kw)
+
+    def frame_numbers(self):
+        out=[]
+        for p in self.frames_dir.glob("t*.png"):
+            m=re.fullmatch(r"t(\d+)\.png",p.name,re.I)
+            if m: out.append(int(m.group(1)))
+        return sorted(out)
+
+    def frame_health(self):
+        nums=self.frame_numbers()
+        if not nums: return {"count":0,"min":None,"max":None,"missing":[],"corrupt":[]}
+        lo, hi=nums[0], nums[-1]
+        existing=set(nums)
+        missing=[n for n in range(lo,hi+1) if n not in existing]
+        corrupt=[]
+        for n in nums:
+            try:
+                with Image.open(self.frames_dir/f"t{n}.png") as im: im.verify()
+            except Exception: corrupt.append(n)
+        return {"count":len(nums)-len(corrupt),"total_files":len(nums),"min":lo,"max":hi,"missing":missing,"corrupt":corrupt}
+
+    def status(self):
+        h=self.frame_health()
+        with self.lock:
+            return {"job":dict(self.job),"settings":self.settings,"frames":h}
+
+SESSIONS={}
+SESSIONS_LOCK=threading.Lock()
+def get_state(sid):
+    sid=safe_sid(sid)
+    with SESSIONS_LOCK:
+        if sid not in SESSIONS: SESSIONS[sid]=SessionState(sid)
+        return SESSIONS[sid]
+
+
+GLOBAL={"canvases":{},"canvas_error":"","ffmpeg":find_exec("ffmpeg"),"ffprobe":find_exec("ffprobe"),"boot":{}}
+
+def load_canvases():
+    try:
+        req=urllib.request.Request(CANVASES_URL,headers={"User-Agent":USER_AGENT})
+        with urllib.request.urlopen(req,timeout=10) as resp:
+            data=json.loads(resp.read().decode())
+        GLOBAL["canvases"]=data.get("canvases",data);GLOBAL["canvas_error"]=""
+        return True
+    except Exception as e:
+        GLOBAL["canvas_error"]=str(e);GLOBAL["canvases"]={};return False
+
+load_canvases()
+
+
+def boot_checks():
+    checks=[]
+    checks.append({"name":"Python ortamı","ok":True,"detail":f"Python {sys.version_info.major}.{sys.version_info.minor}"})
+    checks.append({"name":"Dosya sistemi","ok":os.access(STORAGE,os.W_OK),"detail":str(STORAGE)})
+    ff=GLOBAL.get("ffmpeg") or find_exec("ffmpeg");GLOBAL["ffmpeg"]=ff
+    checks.append({"name":"FFmpeg","ok":bool(ff),"detail":ff or "Bulunamadı"})
+    try:
+        req=urllib.request.Request(PIXMAP_URL,headers={"User-Agent":USER_AGENT})
+        with urllib.request.urlopen(req,timeout=6) as r: ok=200 <= r.status < 500
+        checks.append({"name":"pixmap.fun","ok":ok,"detail":PIXMAP_URL})
+    except Exception as e:
+        checks.append({"name":"pixmap.fun","ok":False,"detail":str(e)})
+    ok=load_canvases()
+    checks.append({"name":"Tuval API","ok":ok,"detail":f"{len(GLOBAL['canvases'])} tuval" if ok else GLOBAL['canvas_error']})
+    GLOBAL["boot"]={"checks":checks,"time":time.time()}
+    return GLOBAL["boot"]
+
+
+def live_area_image(canvas_id,start,end):
+    canvas=GLOBAL["canvases"].get(str(canvas_id))
+    if not canvas: raise ValueError("Tuval bulunamadı.")
+    x1,y1,x2,y2=parse_coords(start,end,canvas);w,h=x2-x1+1,y2-y1+1
+    if w*h>60_000_000: raise ValueError("Seçilen alan çok büyük. Daha küçük bir alan seç.")
+    chunks,_,center=get_canvas_geometry(canvas);pal=build_palette(canvas);bg=tuple(canvas.get("colors",[[202,227,255]])[0][:3])+(255,)
+    out=Image.new("RGBA",(w,h),bg);expected=CHUNK_PX*CHUNK_PX
+    cxs=max(0,(x1+center)//CHUNK_PX);cys=max(0,(y1+center)//CHUNK_PX);cxe=min(chunks-1,(x2+center)//CHUNK_PX);cye=min(chunks-1,(y2+center)//CHUNK_PX)
+    sess=make_session();jobs=[(cx,cy) for cy in range(cys,cye+1) for cx in range(cxs,cxe+1)]
+    def one(pair):
+        cx,cy=pair;return cx,cy,fetch_raw(f"{PIXMAP_URL}/chunks/{canvas_id}/{cx}/{cy}",sess,7)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for cx,cy,data in pool.map(one,jobs):
+            if not data: continue
+            raw=bytes(b&0x7F for b in data)
+            if len(raw)<expected: raw+=bytes(expected-len(raw))
+            im=Image.frombytes("P",(CHUNK_PX,CHUNK_PX),raw[:expected]);im.putpalette(pal)
+            safe_paste(out,im.convert("RGBA"),cx*CHUNK_PX-center-x1,cy*CHUNK_PX-center-y1)
+    if sess and HAVE_REQUESTS: sess.close()
+    return out,(x1,y1,x2,y2)
+
+
+def media_verify(path, fmt):
+    path=Path(path)
+    if not path.is_file() or path.stat().st_size<1024: return {"ok":False,"detail":"Dosya oluşmadı veya boş."}
+    ffprobe=GLOBAL.get("ffprobe") or find_exec("ffprobe");GLOBAL["ffprobe"]=ffprobe
+    if not ffprobe: return {"ok":True,"detail":"Dosya oluştu; ffprobe bulunamadı."}
+    try:
+        cmd=[ffprobe,"-v","error","-select_streams","v:0","-show_entries","stream=codec_name,width,height,pix_fmt","-of","json",str(path)]
+        p=subprocess.run(cmd,capture_output=True,text=True,timeout=30)
+        if p.returncode!=0: return {"ok":False,"detail":p.stderr[-500:]}
+        dat=json.loads(p.stdout or "{}");s=(dat.get("streams") or [{}])[0]
+        return {"ok":True,"detail":f"{s.get('codec_name','?')} • {s.get('width','?')}×{s.get('height','?')} • {s.get('pix_fmt','?')}"}
+    except Exception as e: return {"ok":False,"detail":str(e)}
+
+
+def unique_output(st, stem, ext):
+    p=st.outputs_dir/f"{stem}.{ext}"
+    i=2
+    while p.exists():
+        p=st.outputs_dir/f"{stem}_{i}.{ext}";i+=1
+    return p
+
+
+def compile_range(st,start_frame,end_frame,opts,preview=False):
+    ffmpeg=GLOBAL.get("ffmpeg") or find_exec("ffmpeg");GLOBAL["ffmpeg"]=ffmpeg
+    if not ffmpeg: raise RuntimeError("FFmpeg bulunamadı.")
+    if start_frame>end_frame: start_frame,end_frame=end_frame,start_frame
+    missing=[];corrupt=[]
+    for n in range(start_frame,end_frame+1):
+        p=st.frames_dir/f"t{n}.png"
+        if not p.is_file(): missing.append(n);continue
+        try:
+            with Image.open(p) as im: im.verify()
+        except Exception: corrupt.append(n)
+    if missing or corrupt:
+        raise RuntimeError(f"Eksik kare: {missing[:8]}{'…' if len(missing)>8 else ''} | Bozuk: {corrupt[:8]}{'…' if len(corrupt)>8 else ''}")
+    count=end_frame-start_frame+1
+    manual_fps=float(opts.get("fps",30) or 30);speed=float(opts.get("speed",1) or 1)
+    target=float(opts.get("target_seconds",0) or 0)
+    fps=(count/target) if target>0 else manual_fps*speed
+    fps=max(1,min(120,fps))
+    fmt=(opts.get("format") or "mp4").lower();scale=max(1,int(opts.get("scale",1) or 1));compat=bool(opts.get("compat",True));limit_label=opts.get("limit","4K");quality=quality_profile(opts.get("quality","Dengeli"))
+    ext="gif" if fmt=="gif" else ("webm" if "webm" in fmt else "mp4")
+    stem=("preview_" if preview else "pixmap_")+datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")+f"_t{start_frame}-{end_frame}"
+    out=unique_output(st,stem,ext)
+    cmd=[ffmpeg,"-y","-framerate",f"{fps:.4f}","-start_number",str(start_frame),"-f","image2","-i",str(st.frames_dir/"t%d.png"),"-frames:v",str(count)]
+    filters=[]
+    if scale>1: filters.append(f"scale=iw*{scale}:ih*{scale}:flags=neighbor")
+    lim=resolution_limit(limit_label)
+    if lim:
+        filters.append(f"scale='min({lim[0]},iw)':'min({lim[1]},ih)':
