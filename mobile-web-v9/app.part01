@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Pixmap Studio Mobile Web V9
+- Mobil/PWA arayüz
+- V9 masaüstü sürümündeki timelapse, kare stüdyosu, kalite/uyumluluk,
+  log, oturum kurtarma ve efekt ayarlarının mobil karşılıkları
+- Pixmap endpoint yapısı değiştirilmez.
+"""
+import os, io, re, json, math, time, shutil, socket, mimetypes, datetime, threading, subprocess, urllib.request, hashlib
+from pathlib import Path
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    HAVE_REQUESTS = True
+except Exception:
+    HAVE_REQUESTS = False
+
+from PIL import Image
+
+PIXMAP_URL = os.environ.get("PIXMAP_URL", "https://pixmap.fun").rstrip("/")
+CANVASES_URL = f"{PIXMAP_URL}/api/canvases"
+CHUNK_PX = 256
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "24"))
+USER_AGENT = "PixmapStudio-MobileWeb-V9/1.0"
+ROOT = Path(__file__).resolve().parent
+WWW = ROOT / "www"
+STORAGE = ROOT / "storage"
+STORAGE.mkdir(exist_ok=True)
+PORT = int(os.environ.get("PORT", "8765"))
+HOST = "0.0.0.0"
+APP_PIN = os.environ.get("APP_PIN", "").strip()
+
+
+def safe_sid(s):
+    s = re.sub(r"[^a-zA-Z0-9_-]", "", s or "")[:64]
+    return s or "default"
+
+
+def session_dir(sid):
+    d = STORAGE / safe_sid(sid)
+    (d / "timelapse").mkdir(parents=True, exist_ok=True)
+    (d / "outputs").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def atomic_json(path, data):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def safe_paste(dst_img, src_img, x, y):
+    dw, dh = dst_img.size
+    sw, sh = src_img.size
+    sx1, sy1 = max(0, -x), max(0, -y)
+    sx2, sy2 = min(sw, dw - x), min(sh, dh - y)
+    if sx1 >= sx2 or sy1 >= sy2:
+        return
+    crop = src_img.crop((sx1, sy1, sx2, sy2))
+    dst_img.paste(crop, (max(0, x), max(0, y)), crop if crop.mode == "RGBA" else None)
+
+
+def build_palette(canvas):
+    colors = canvas.get("colors", [])
+    flat = []
+    for c in colors:
+        flat.extend(c[:3])
+    if len(flat) < 768:
+        flat.extend([0] * (768 - len(flat)))
+    return flat[:768]
+
+
+def get_canvas_geometry(canvas):
+    raw = int(canvas.get("size", 256))
+    if raw <= 1024:
+        chunks, pixels = raw, raw * CHUNK_PX
+    else:
+        chunks, pixels = raw // CHUNK_PX, raw
+    return chunks, pixels, pixels // 2
+
+
+def make_session():
+    if not HAVE_REQUESTS:
+        return None
+    s = requests.Session()
+    ad = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=2)
+    s.mount("https://", ad)
+    s.mount("http://", ad)
+    s.headers["User-Agent"] = USER_AGENT
+    return s
+
+
+def fetch_raw(url, session=None, timeout=8):
+    try:
+        if session is not None:
+            r = session.get(url, timeout=timeout)
+            if r.status_code == 404:
+                return None
+            return r.content if r.status_code == 200 else None
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read() if resp.status == 200 else None
+    except Exception:
+        return None
+
+
+def normalize_coordinate(value):
+    s = (value or "").strip()
+    if not s:
+        raise ValueError("Koordinat boş.")
+    # #d,5621,-7544,40 -> 5621_-7544
+    m = re.search(r"#?[A-Za-z]*\s*,?\s*(-?\d+(?:\.\d+)?)\s*[, _;]\s*(-?\d+(?:\.\d+)?)", s)
+    if m:
+        x, y = m.group(1), m.group(2)
+    else:
+        parts = re.findall(r"-?\d+(?:\.\d+)?", s)
+        if len(parts) < 2:
+            raise ValueError("Koordinat anlaşılamadı. Örnek: #d,5621,-7544,40")
+        x, y = parts[0], parts[1]
+    return f"{math.floor(float(x))}_{math.floor(float(y))}"
+
+
+def parse_coords(start, end, canvas):
+    a = normalize_coordinate(start).split("_")
+    b = normalize_coordinate(end).split("_")
+    xs, ys, xe, ye = map(int, [a[0], a[1], b[0], b[1]])
+    x1, x2 = sorted((xs, xe)); y1, y2 = sorted((ys, ye))
+    _, _, center = get_canvas_geometry(canvas)
+    mn, mx = -center, center - 1
+    if x1 < mn or y1 < mn or x2 > mx or y2 > mx:
+        raise ValueError(f"Koordinatlar {mn} ile {mx} arasında olmalı.")
+    return x1, y1, x2, y2
+
+
+def find_exec(name):
+    direct = shutil.which(name)
+    if direct:
+        return direct
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = []
+        if local:
+            base = Path(local) / "Microsoft" / "WinGet" / "Packages"
+            if base.exists():
+                candidates += list(base.glob(f"Gyan.FFmpeg*/**/bin/{name}.exe"))
+        candidates += [Path(f"C:/ffmpeg/bin/{name}.exe"), Path.home()/f"scoop/apps/ffmpeg/current/bin/{name}.exe"]
+        for p in candidates:
+            if p.is_file():
+                return str(p)
+    return None
+
+
+def quality_profile(name):
+    n = (name or "Dengeli").lower()
+    if "hız" in n or "fast" in n:
+        return {"preset":"veryfast","crf":"23"}
+    if "yüksek" in n or "high" in n:
+        return {"preset":"slow","crf":"18"}
+    if "arşiv" in n or "archive" in n:
+        return {"preset":"veryslow","crf":"15"}
+    return {"preset":"medium","crf":"20"}
+
+
+def resolution_limit(label):
+    s = (label or "4K").lower()
+    if "1080" in s: return (1920,1080)
+    if "1440" in s: return (2560,1440)
+    if "4k" in s: return (3840,2160)
+    return None
+
+
+def predict_dims(w, h, scale, limit_label):
+    scale = max(1, int(scale or 1))
+    ow, oh = w * scale, h * scale
+    lim = resolution_limit(limit_label)
+    if lim and (ow > lim[0] or oh > lim[1]):
+        ratio = min(lim[0]/ow, lim[1]/oh)
+        ow, oh = max(2,int(ow*ratio)), max(2,int(oh*ratio))
+    ow += ow % 2; oh += oh % 2
+    return ow, oh
+
+
+class SessionState:
+    def __init__(self, sid):
+        self.sid = safe_sid(sid)
+        self.lock = threading.RLock()
+        self.job = {"running":False,"cancel":False,"kind":"","progress":0.0,"status":"Hazır","logs":[],"output":None,"frames":0,"ok":None}
+        self.settings = {}
+        self.last_area = None
+        self.load()
+
+    @property
+    def root(self): return session_dir(self.sid)
+    @property
+    def frames_dir(self): return self.root / "timelapse"
+    @property
+    def outputs_dir(self): return self.root / "outputs"
+
+    def load(self):
+        p = session_dir(self.sid) / "settings.json"
+        if p.is_file():
+            try: self.settings = json.loads(p.read_text(encoding="utf-8"))
+            except Exception: self.settings = {}
+
+    def save_settings(self, data):
+        self.settings.update(data or {})
+        atomic_json(self.root / "settings.json", self.settings)
+
+    def log(self, msg):
+        with self.lock:
+            stamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.job["logs"].append(f"[{stamp}] {msg}")
+            self.job["logs"] = self.job["logs"][-25
