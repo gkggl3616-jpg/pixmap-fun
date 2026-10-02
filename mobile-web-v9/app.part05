@@ -1,0 +1,26 @@
+False);return self.send_json({"ok":True})
+            if p=="/api/preview-video": run_compile(st,d,True);return self.send_json({"ok":True})
+            if p=="/api/cancel": st.set_job(cancel=True,status="İptal ediliyor…");return self.send_json({"ok":True})
+            if p=="/api/cleanup":
+                a=int(d.get("start",1));b=int(d.get("end",10**9));deleted=0
+                for n in st.frame_numbers():
+                    if a<=n<=b:
+                        try:(st.frames_dir/f"t{n}.png").unlink();deleted+=1
+                        except OSError:pass
+                st.log(f"{deleted} PNG kare temizlendi.");return self.send_json({"ok":True,"deleted":deleted})
+            return self.send_json({"error":"Bulunamadı."},404)
+        except Exception as e:
+            st.log("İstek hatası: "+str(e));return self.send_json({"error":str(e)},400)
+
+
+def main():
+    print(f"Pixmap Studio Mobile Web V9 -> http://0.0.0.0:{PORT}")
+    print("PIXMAP_URL:",PIXMAP_URL)
+    srv=ThreadingHTTPServer((HOST,PORT),Handler)
+    try:srv.serve_forever()
+    except KeyboardInterrupt:pass
+    finally:srv.server_close()
+
+if __name__=="__main__":
+    import sys
+    main()
