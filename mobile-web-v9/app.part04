@@ -1,0 +1,87 @@
+rel.save(fp)
+                    last=rel;pct=((di+(idx+1)/max(1,len(diffs)))/days)*(88 if compile_video else 100);st.set_job(progress=round(pct,2),status=f"{day} {hhmm} • Kare {frame_cnt}",frames=frame_cnt)
+                previous=last.copy();curr+=datetime.timedelta(days=1)
+            health=st.frame_health();st.log(f"Kare özeti: {health['count']} sağlam • {len(health['missing'])} eksik • {len(health['corrupt'])} bozuk • {reused} yeniden kullanıldı • {repaired} onarıldı")
+            output=None
+            if compile_video and frame_cnt:
+                st.set_job(progress=90,status="Video oluşturuluyor…")
+                output,actual,_=compile_range(st,1,frame_cnt,payload,preview=False);st.log(f"Video hazır: {output.name} • {actual:.2f} FPS")
+            st.set_job(running=False,progress=100,status="Tamamlandı ✓",output=output.name if output else None,frames=frame_cnt,ok=True)
+        except Exception as ex:
+            st.log("HATA: "+str(ex));st.set_job(running=False,progress=0,status="Hata: "+str(ex),ok=False)
+        finally:
+            if sess and HAVE_REQUESTS:sess.close()
+    threading.Thread(target=worker,daemon=True).start()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version="PixmapStudioMobileWebV9/1.0"
+    def log_message(self,*a): pass
+    def sid(self): return safe_sid(self.headers.get("X-Session-Id","") or parse_qs(urlparse(self.path).query).get("sid",[""])[0])
+    def auth_ok(self): return not APP_PIN or self.headers.get("X-App-Pin","")==APP_PIN
+    def body(self):
+        n=int(self.headers.get("Content-Length","0") or 0);raw=self.rfile.read(n) if n else b"{}";return json.loads(raw.decode("utf-8") or "{}")
+    def send_bytes(self,data,ctype="application/octet-stream",code=200,extra=None):
+        self.send_response(code);self.send_header("Content-Type",ctype);self.send_header("Content-Length",str(len(data)));self.send_header("Cache-Control","no-store")
+        if extra:
+            for k,v in extra.items():self.send_header(k,v)
+        self.end_headers();self.wfile.write(data)
+    def send_json(self,obj,code=200): self.send_bytes(json.dumps(obj,ensure_ascii=False).encode("utf-8"),"application/json; charset=utf-8",code)
+    def send_file(self,path,download=False):
+        path=Path(path)
+        if not path.is_file(): return self.send_json({"error":"Dosya bulunamadı."},404)
+        ctype=mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self.send_response(200);self.send_header("Content-Type",ctype);self.send_header("Content-Length",str(path.stat().st_size));self.send_header("Cache-Control","no-store")
+        if download:self.send_header("Content-Disposition",f'attachment; filename="{path.name}"')
+        self.end_headers()
+        with open(path,"rb") as f: shutil.copyfileobj(f,self.wfile,1024*1024)
+    def require_auth(self):
+        if self.auth_ok(): return True
+        self.send_json({"error":"PIN gerekli."},401);return False
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=="/health": return self.send_json({"ok":True})
+        if p.startswith("/api/") and not self.require_auth(): return
+        if p=="/api/bootstrap": return self.send_json({"canvases":GLOBAL["canvases"],"canvas_error":GLOBAL["canvas_error"],"ffmpeg":bool(GLOBAL["ffmpeg"]),"ffprobe":bool(GLOBAL["ffprobe"]),"pin_required":bool(APP_PIN)})
+        if p=="/api/boot-check": return self.send_json(boot_checks())
+        if p=="/api/status": return self.send_json(get_state(self.sid()).status())
+        if p=="/api/settings": return self.send_json(get_state(self.sid()).settings)
+        if p=="/api/outputs":
+            st=get_state(self.sid());files=[]
+            for x in sorted(st.outputs_dir.glob("*"),key=lambda z:z.stat().st_mtime,reverse=True):
+                if x.is_file(): files.append({"name":x.name,"size":x.stat().st_size,"mtime":x.stat().st_mtime})
+            return self.send_json({"files":files})
+        if p.startswith("/api/frame/"):
+            st=get_state(self.sid());n=int(p.rsplit("/",1)[1]);fp=st.frames_dir/f"t{n}.png"
+            if not fp.is_file(): return self.send_json({"error":"Kare bulunamadı."},404)
+            try:
+                with Image.open(fp) as im:
+                    im=im.convert("RGB");im.thumbnail((1500,1500),Image.Resampling.NEAREST);b=io.BytesIO();im.save(b,"JPEG",quality=88)
+                return self.send_bytes(b.getvalue(),"image/jpeg")
+            except Exception as e:return self.send_json({"error":str(e)},400)
+        if p=="/api/log.txt":
+            st=get_state(self.sid());data=("\n".join(st.job.get("logs",[])) or "Log boş.").encode("utf-8");return self.send_bytes(data,"text/plain; charset=utf-8",extra={"Content-Disposition":'attachment; filename="pixmap_log.txt"'})
+        if p.startswith("/download/"):
+            st=get_state(self.sid());name=Path(unquote(p[len("/download/"):])).name;return self.send_file(st.outputs_dir/name,download=True)
+        # static
+        rel="index.html" if p=="/" else p.lstrip("/")
+        fp=(WWW/rel).resolve()
+        if WWW.resolve() not in fp.parents and fp!=WWW.resolve(): return self.send_json({"error":"Geçersiz yol."},400)
+        if fp.is_file(): return self.send_file(fp)
+        return self.send_json({"error":"Bulunamadı."},404)
+    def do_POST(self):
+        p=urlparse(self.path).path
+        if p.startswith("/api/") and not self.require_auth(): return
+        st=get_state(self.sid())
+        try:
+            d=self.body()
+            if p=="/api/normalize": return self.send_json({"value":normalize_coordinate(d.get("value",""))})
+            if p=="/api/settings": st.save_settings(d);return self.send_json({"ok":True})
+            if p=="/api/preview":
+                im,coords=live_area_image(d.get("canvas_id","0"),d.get("start",""),d.get("end",""));st.last_area={"coords":coords,"size":im.size};thumb=im.copy();thumb.thumbnail((1800,1800),Image.Resampling.LANCZOS);b=io.BytesIO();thumb.convert("RGB").save(b,"JPEG",quality=90,optimize=True);return self.send_bytes(b.getvalue(),"image/jpeg",extra={"X-Area":",".join(map(str,coords))})
+            if p=="/api/snapshot":
+                im,coords=live_area_image(d.get("canvas_id","0"),d.get("start",""),d.get("end",""));b=io.BytesIO();im.save(b,"PNG");return self.send_bytes(b.getvalue(),"image/png",extra={"Content-Disposition":f'attachment; filename="pixmap_area_{coords[0]}_{coords[1]}_{coords[2]}_{coords[3]}.png"'})
+            if p=="/api/preflight":
+                canvas=GLOBAL["canvases"].get(str(d.get("canvas_id","0")));coords=parse_coords(d.get("start",""),d.get("end",""),canvas);w,h=coords[2]-coords[0]+1,coords[3]-coords[1]+1;ow,oh=predict_dims(w,h,d.get("scale",1),d.get("limit","4K"));return self.send_json({"source":[w,h],"output":[ow,oh],"compat":bool(d.get("compat",True)),"format":d.get("format","mp4"),"quality":d.get("quality","Dengeli")})
+            if p=="/api/timelapse/start": run_timelapse(st,d);return self.send_json({"ok":True})
+            if p=="/api/compile": run_compile(st,d,
